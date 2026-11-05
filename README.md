@@ -164,3 +164,14 @@ python build.py            # -> dist/honcho_memory.py
 ## License
 
 MIT © [fubarpie](https://github.com/fubarpie)
+## Importing existing chat history
+
+Export from Open WebUI (Settings → Data Controls → Export Chats), then:
+
+```bash
+export HONCHO_TOKEN=...   # keep the token out of shell history/args
+python scripts/import_chats.py chats-export.json --url http://HONCHO:8000 --dry-run
+python scripts/import_chats.py chats-export.json --url http://HONCHO:8000
+```
+
+Only the active branch of each chat is imported; reasoning blocks and injected memory blocks are stripped. Re-runs skip chats already imported (`.import_state.json`).
