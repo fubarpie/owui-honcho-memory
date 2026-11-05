@@ -24,9 +24,12 @@ import httpx
 import copy
 import re
 from typing import Any
+import datetime as _dt
+from collections import OrderedDict
+from typing import Any, NamedTuple
+from typing import Callable, Iterable, Sequence
 import hashlib
 import logging
-from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from pydantic import BaseModel, Field
 
@@ -225,6 +228,24 @@ class HonchoClient:
             body["metadata"] = metadata
         await self._request("POST", f"{self._ws()}/sessions", json_body=body, retry=True)
         self._remember(self._known_sessions, key)
+
+    async def update_peer(
+        self,
+        peer_id: str,
+        metadata: dict | None = None,
+        configuration: dict | None = None,
+    ) -> None:
+        """Update an existing peer via PUT /v3/workspaces/{ws}/peers/{peer_id}.
+
+        Idempotent (retried on 5xx / transport errors). Used for defense-in-depth
+        server-side rules, e.g. an instruction to never record the user's real name.
+        """
+        body: dict[str, Any] = {}
+        if metadata is not None:
+            body["metadata"] = metadata
+        if configuration is not None:
+            body["configuration"] = configuration
+        await self._request("PUT", self._peer(peer_id), json_body=body, retry=True)
 
     # ------------------------------------------------------------------ messages
     async def add_messages(self, session_id: str, messages: list[dict]) -> list[dict]:
@@ -469,15 +490,73 @@ def clean_message_for_save(text: str | None, max_chars: int = 4000) -> str:
 def mask_peer_ids(text: str | None, peer_ids: list[str] | tuple[str, ...], label: str) -> str:
     """Replace raw Honcho peer ids (e.g. 'user-<uuid>') with a readable label.
 
-    Honcho's extraction prompts name the user by peer id, which wastes context and
-    reads badly. Longest ids are replaced first; blank ids/labels are no-ops.
+    Backward-compatible thin wrapper around :func:`unmask_peer_ids` (which also
+    handles tolerant/truncated uuid-form ids).
+    """
+    return unmask_peer_ids(text, peer_ids, label)
+
+
+# Ordinary English words that must not be scrubbed when they merely coincide with a
+# single-word name part. Given names are deliberately NOT listed: a user called Sam or
+# Mark must still be masked, because leaking the real name defeats the whole feature.
+_SCRUB_STOPWORDS = frozenset(
+    ["the", "and", "but", "for", "not", "nor", "one", "two", "six", "ten", "all", "any",
+     "few", "own", "too", "very", "yet", "may", "can", "van", "von", "der", "del", "dos"]
+)
+
+
+def scrub_names(text: str | None, names: list[str] | tuple[str, ...], replacement: str) -> str:
+    """Replace whole-word, case-insensitive occurrences of ``names`` with ``replacement``.
+
+    Used for ingress pseudonymization: every mention of the user's display name
+    (full name and its parts) sent to Honcho becomes the user's peer id. Single-word
+    names shorter than 3 chars, or in a small stoplist of common English words, are
+    ignored (multi-word names are always scrubbed) so ordinary text is never mangled. Longer names are replaced first
+    (the full display name before its parts). Blank text/replacement is a no-op.
+    """
+    out = text or ""
+    rep = replacement or ""
+    if not out or not rep:
+        return out
+    cands: set[str] = set()
+    for n in names or []:
+        n = str(n or "").strip()
+        if " " in n or (len(n) >= 3 and n.lower() not in _SCRUB_STOPWORDS):
+            cands.add(n)
+    for n in sorted(cands, key=len, reverse=True):
+        out = re.sub(rf"(?<!\w){re.escape(n)}(?!\w)", rep, out, flags=re.IGNORECASE)
+    return out
+
+
+# Prefix of a uuid-form peer id (everything before the first run of 8 hex chars).
+_PEER_HEX_PREFIX_RE = re.compile(r"^(.*?)(?=[0-9a-f]{8})", re.IGNORECASE)
+# Tolerant uuid tail: full 8-4-4-4-12 form, hyphenless, or truncated (>= 8 hex chars).
+_PEER_UUID_TAIL_RE = r"[0-9a-f]{8}(?:-?[0-9a-f]{4}){0,3}(?:-?[0-9a-f]{12})?"
+
+
+def unmask_peer_ids(text: str | None, peer_ids: list[str] | tuple[str, ...], label: str) -> str:
+    """Replace raw Honcho peer ids in ``text`` with a readable ``label``.
+
+    Matches both the exact peer ids (longest first) and a tolerant form of
+    uuid-style ids — the peer prefix followed by a full, hyphenless or
+    truncated (>= 8 hex chars) uuid, case-insensitive — so the user never sees
+    a raw ``user-<uuid>`` even when Honcho truncates or reformats it. Blank
+    ids/labels are no-ops.
     """
     out = text or ""
     label = (label or "").strip()
-    if not label:
+    if not out or not label:
         return out
-    for pid in sorted({p for p in peer_ids if p}, key=len, reverse=True):
+    pids = {p for p in (peer_ids or []) if p}
+    for pid in sorted(pids, key=len, reverse=True):
         out = out.replace(pid, label)
+    prefixes: set[str] = set()
+    for pid in pids:
+        m = _PEER_HEX_PREFIX_RE.match(pid)
+        if m and m.group(1):
+            prefixes.add(m.group(1))
+    for pre in prefixes:
+        out = re.sub(re.escape(pre) + _PEER_UUID_TAIL_RE, label, out, flags=re.IGNORECASE)
     return out
 
 
@@ -966,6 +1045,368 @@ def format_grouped_facts(groups: dict[str, list[str]], query: str | None = None)
     return "\n".join(lines)
 
 
+# ---- 02_zprofile.py ----
+"""Typed observations, commitments, inferences, profile cache, and profile sections.
+
+Pure helpers (stdlib only, no I/O). Depends at runtime on helpers defined earlier in
+the built module namespace (unwrap_observation, approx_tokens, _tokens, _similar,
+is_transient, _compact, truncate_to_tokens) — parts share one namespace after build.
+"""
+
+
+
+
+
+class Obs(NamedTuple):
+    """One observation with its section-derived metadata."""
+
+    text: str
+    date: str | None
+    kind: str  # 'explicit' | 'deductive' | 'inductive' | 'unknown'
+    premise_count: int
+
+
+_SECTION_KIND_RE: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"explicit", re.I), "explicit"),
+    (re.compile(r"deduct", re.I), "deductive"),
+    (re.compile(r"induct|pattern|tendenc", re.I), "inductive"),
+]
+
+
+def _section_kind(header: str) -> str:
+    """Map a section header line to a kind; 'unknown' when unmatched."""
+    for pat, kind in _SECTION_KIND_RE:
+        if pat.search(header):
+            return kind
+    return "unknown"
+
+
+_HEADER_LINE_RE = re.compile(r"^\s*#{1,6}\s*(.*)$")
+_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}(?::\d{2})?)?\]\s*")
+_BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+
+
+def parse_typed_observations(representation: str | None) -> list[Obs]:
+    """Split a representation into Obs records, tracking section kind and premise counts.
+
+    Honely mirrors parse_observations but keeps the section kind and counts 'Premises:'
+    sub-list lines, so commitments/inferences can be weighted by evidence strength.
+    """
+    out: list[Obs] = []
+    kind = "explicit"
+    in_premises = False
+    for raw in (representation or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _HEADER_LINE_RE.match(line)
+        if m:
+            kind = _section_kind(m.group(1))
+            in_premises = False
+            continue
+        low = line.lower()
+        if low.startswith("premises"):
+            in_premises = True
+            continue
+        text = _BULLET_RE.sub("", _TS_RE.sub("", line))
+        text = text.strip()
+        if in_premises and not _TS_RE.match(line):
+            # premise detail line: count it toward the current observation
+            if out:
+                out[-1] = out[-1]._replace(premise_count=out[-1].premise_count + 1)
+            continue
+        in_premises = False  # a timestamped observation line ends any premise list
+        if line.endswith(":") and len(line) < 40 and "[" not in line:
+            continue
+        unwrapped = unwrap_observation(text)
+        if not unwrapped:
+            continue
+        date_m = _TS_RE.match(line)
+        out.append(Obs(text=unwrapped, date=(date_m.group(1) or None) if date_m else None, kind=kind, premise_count=0))
+    return out
+
+
+# --------------------------------------------------------------------------- commitments
+
+_COMMITMENT_RE = re.compile(
+    r"\b(promis\w*|commit(?:ted|ment)|agree[ds]? to|plans? to|needs? to|owes?|"
+    r"will (?:send|deliver|share|provide|get|give|call|write|review|finish|follow up)|"
+    r"to-do|todo|deadline|follow[- ]?up|reminder|deliver(?:s|ed)? (?:the|a|an)?)\b"
+    r"|\bby (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|tomorrow|today"
+    r"|january|february|march|april|may|june|july|august|september|october|november|december)\b",
+    re.IGNORECASE,
+)
+_RESOLVED_RE = re.compile(
+    r"\b(done|completed|finished|sent|delivered|cancelled|canceled|no longer|already|"
+    r"resolved|abandon\w*|withdr\w+|gave up)\b",
+    re.IGNORECASE,
+)
+
+
+def is_commitment(text: str) -> bool:
+    """True if the observation reads as a promise, todo, or deadline (third person)."""
+    return bool(_COMMITMENT_RE.search(text or ""))
+
+
+def is_resolved(text: str) -> bool:
+    """True if the observation states the commitment was done/cancelled/superseded."""
+    return bool(_RESOLVED_RE.search(text or ""))
+
+
+def _age_days(date: str | None, today: _dt.date) -> int:
+    if not date:
+        return 0
+    try:
+        return max((today - _dt.date.fromisoformat(date)).days, 0)
+    except ValueError:
+        return 0
+
+
+def select_commitments(
+    obs: list[Obs],
+    max_items: int = 6,
+    max_age_days: int = 90,
+    today: str | None = None,
+) -> list[str]:
+    """Return open (unresolved, recent) commitment texts, newest first, deduped.
+
+    Never filtered by the current query: commitments must always reach the model.
+    """
+    try:
+        now = _dt.date.fromisoformat(today) if today else _dt.date.today()
+    except ValueError:
+        now = _dt.date.today()
+    cands: list[tuple[int, str, frozenset[str]]] = []
+    for o in obs:
+        if o.kind not in ("explicit", "unknown"):
+            continue  # commitments come from explicit statements, not deductions
+        if is_transient(o.text) or is_resolved(o.text) or not is_commitment(o.text):
+            continue
+        if _age_days(o.date, now) > max_age_days:
+            continue
+        cands.append((_age_days(o.date, now), o.text, frozenset(_tokens(o.text))))
+    cands.sort(key=lambda c: c[0])  # newest (smallest age) first
+    kept: list[str] = []
+    seen: list[frozenset[str]] = []
+    for _, text, tok in cands:
+        if any(_similar(tok, s, 0.7) for s in seen):
+            continue
+        kept.append(_compact(text))
+        seen.append(tok)
+        if len(kept) >= max_items:
+            break
+    return kept
+
+
+# --------------------------------------------------------------------------- inferences
+
+def _days_between(later: str, earlier: str) -> int:
+    """Days from earlier to later iso date (0 on parse failure or inverted)."""
+    try:
+        return max((_dt.date.fromisoformat(later) - _dt.date.fromisoformat(earlier)).days, 0)
+    except ValueError:
+        return 0
+
+
+def select_inferences(
+    obs: list[Obs],
+    query: str | None,
+    max_tokens: int = 250,
+    known_texts: Sequence[str] = (),
+) -> list[tuple[str, str]]:
+    """Pick deductive/inductive observations as (text, evidence_label), budgeted by tokens.
+
+    Ranked by premise_count, then query relevance, then recency. Exempt from the
+    'overlap with the query' rule that applies to ordinary facts.
+    """
+    qtok = _tokens(query or "")
+    known = [_tokens(k) for k in known_texts if k]
+
+    # Newest observation date in the set anchors relative recency (no hidden clock).
+    dates = [o.date for o in obs if o.date]
+    newest = max(dates) if dates else None
+
+    cands: list[tuple[tuple[int, float, int], Obs]] = []
+    cands_seen: list[frozenset[str]] = []
+    for o in obs:
+        if o.kind not in ("deductive", "inductive"):
+            continue
+        if is_transient(o.text):
+            continue
+        tok = frozenset(_tokens(o.text))
+        if not tok or any(_similar(tok, k, 0.6) for k in known):
+            continue
+        if any(_similar(tok, s, 0.8) for s in cands_seen):
+            continue
+        overlap = len(qtok & tok) / len(qtok) if qtok else 0.0
+        recency = _days_between(newest, o.date) if (o.date and newest) else 0
+        cands.append(((o.premise_count, overlap, -recency), o))
+        cands_seen.append(tok)
+    cands.sort(key=lambda c: (-c[0][0], -c[0][1], -c[0][2]))
+
+    out: list[tuple[str, str]] = []
+    used = 0
+    for _, o in cands:
+        text = _compact(o.text)
+        label = f"inferred from {o.premise_count} observations" if o.premise_count else "inferred"
+        cost = approx_tokens(text) + 1
+        if used + cost > max_tokens:
+            continue
+        out.append((text, label))
+        used += cost
+    return out
+
+
+# --------------------------------------------------------------------------- profile cache
+
+class ProfileCache:
+    """Bounded in-memory LRU cache of distilled profile text keyed by user id.
+
+    All time is passed in explicitly (no hidden clock) so behaviour is testable.
+    """
+
+    def __init__(self, capacity: int = 512) -> None:
+        self._capacity = max(1, int(capacity))
+        self._data: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+    def get(self, uid: str) -> str:
+        """Return cached profile text ('' if none); refreshes LRU position."""
+        entry = self._data.get(uid)
+        if entry is None:
+            return ""
+        self._data.move_to_end(uid)
+        return entry["text"]
+
+    def put(self, uid: str, text: str, msg_count: int, now: float) -> None:
+        """Store/replace the profile for uid with metadata (msg_count, timestamp)."""
+        self._data[uid] = {"text": text, "msg_count": int(msg_count), "ts": float(now)}
+        self._data.move_to_end(uid)
+        while len(self._data) > self._capacity:
+            self._data.popitem(last=False)
+
+    def needs_refresh(
+        self,
+        uid: str,
+        msg_count: int,
+        now: float,
+        ttl_seconds: float = 21600,
+        every_n_messages: int = 30,
+    ) -> bool:
+        """True when the entry is missing/stale (ttl) or msg_count jumped by >= every_n."""
+        e = self._data.get(uid)
+        if e is None:
+            return True
+        if now - e["ts"] > ttl_seconds:
+            return True
+        return (int(msg_count) - e["msg_count"]) >= every_n_messages
+
+    def msg_count(self, uid: str) -> int:
+        """Messages counted so far for uid (0 if unknown)."""
+        e = self._data.get(uid)
+        return int(e["msg_count"]) if e else 0
+
+    def bump(self, uid: str) -> None:
+        """Count one message seen for uid (creates a stub entry if absent)."""
+        e = self._data.get(uid)
+        if e is None:
+            self._data[uid] = {"text": "", "msg_count": 1, "ts": float("-inf")}
+        else:
+            e["msg_count"] = e["msg_count"] + 1
+            self._data.move_to_end(uid)
+
+    def invalidate(self, uid: str) -> None:
+        """Drop the cached profile for uid (no-op when absent)."""
+        self._data.pop(uid, None)
+
+
+# --------------------------------------------------------------------------- dialectic questions
+
+PROFILE_QUESTIONS: list[str] = [
+    "What is the user's communication style and preferred answer format (prose, bullets, code-first, level of detail)?",
+    "What are the user's main interests and values (e.g. open-source, self-hosting, privacy, specific projects)?",
+    "What is the user's technical level and working style (languages, tools, how they like tasks broken down)?",
+    "What personality traits and helping style does the user respond best to (e.g. directness, autonomy, delegation to sub-agents)?",
+]
+
+
+def build_profile_prompt(label_or_peer_id: str) -> str:
+    """Build one compact prompt asking Honcho to answer all PROFILE_QUESTIONS at once."""
+    label = (label_or_peer_id or "the user").strip() or "the user"
+    questions = "\n".join(f"- {q}" for q in PROFILE_QUESTIONS)
+    return (
+        f"Answer the following about {label} in one compact bullet list:\n"
+        f"{questions}\n"
+        "State only what the evidence supports; mark uncertain items with (tentative). "
+        "No names or addresses. Max ~12 bullets, <=150 words per answer. "
+        "If there is no evidence for a question, skip it."
+    )
+
+
+_ABSTAIN_RE = re.compile(
+    r"\b(no (?:information|evidence|data)|not enough|insufficient|unknown|cannot determine|"
+    r"don'?t (?:know|have)|do not (?:know|have)|unable to (?:determine|answer)|no clear|nothing (?:is )?known)\b",
+    re.IGNORECASE,
+)
+_FLUFF_RE = re.compile(
+    r"^\s*(?:here(?:'s| is)?|based on|according to|from)\b.*?(?:profile|observation|evidence|data|conversation)s?\s*(?:,|:|for the user)?\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_profile_answer(text: str, max_tokens: int = 300) -> str:
+    """Clean a profile answer: unwrap JSON, strip fluff, drop abstentions, truncate.
+
+    Returns '' for abstaining answers ('I don't have enough information...').
+    """
+    t = unwrap_observation(text or "")
+    if not t:
+        return ""
+    t = re.sub(r"\s+", " ", t).strip()
+    if _ABSTAIN_RE.search(t) and approx_tokens(t) < 60:
+        return ""
+    t = _FLUFF_RE.sub("", t)
+    t = truncate_to_tokens(t, int(max_tokens))
+    return t.strip()
+
+
+# --------------------------------------------------------------------------- section formatting
+
+_DEFAULT_BUDGETS = {"profile": 300, "commitments": 150, "inferences": 250, "facts": 400}
+
+
+def format_profile_sections(
+    profile: str,
+    commitments: list[str],
+    inferences: list[tuple[str, str]],
+    facts: str,
+    budgets: dict[str, int] | None = None,
+) -> str:
+    """Render the memory block body with labelled sections; empty sections omitted."""
+    b = {**_DEFAULT_BUDGETS, **(budgets or {})}
+    lines: list[str] = []
+    p = truncate_to_tokens((profile or "").strip(), b["profile"])
+    if p:
+        lines += ["Who they are (inferred profile, may be wrong):", p]
+    if commitments:
+        cl = truncate_to_tokens("\n".join(f"- {_compact(c)}" for c in commitments), b["commitments"])
+        if cl:
+            lines += ["Open commitments & promises:"] + cl.splitlines()
+    if inferences:
+        chunk = "\n".join(f"- {t} ({lbl})" for t, lbl in inferences)
+        chunk = truncate_to_tokens(chunk, b["inferences"])
+        if chunk:
+            lines += ["Inferred traits:"] + chunk.splitlines()
+    f = truncate_to_tokens((facts or "").strip(), b["facts"])
+    if f:
+        lines += ["Other known facts:"] + [ln.rstrip() for ln in f.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    lines.append(
+        "Treat inferences as hypotheses, not facts. Do not mention the memory system unless asked."
+    )
+    return "\n".join(lines)
+
+
 # ---- 03_filter.py ----
 _log = logging.getLogger("honcho_memory")
 
@@ -975,6 +1416,7 @@ _HELP_TEXT = (
     "- `/memory remember <fact>`: store a fact about you\n"
     "- `/memory forget [text|id]`: find a stored fact and delete it by id\n"
     "- `/memory ask <question>`: ask the memory system a question about you\n"
+    "- `/memory profile`: rebuild and show the inferred profile (interests, style, personality)\n"
     "- `/memory dream`: consolidate memory now (builds the peer card; takes a few minutes)\n"
     "- `/memory off` / `/memory on`: pause or resume memory (in-memory switch only)\n"
     "- `/memory help`: show this help"
@@ -986,6 +1428,8 @@ _OFF_LIMITS = (
     "for you, but it does NOT delete anything already stored. For a permanent opt-out, turn off "
     "'enabled' in this filter's user settings (UserValves)."
 )
+
+
 
 
 class Filter:
@@ -1012,8 +1456,23 @@ class Filter:
             description="Replace the raw peer id (user-<uuid>) in injected memory with user_label.",
         )
         user_label: str = Field(
-            default="the user",
+            default="{name}",
             description="Label used instead of the peer id. Use '{name}' for the Open WebUI display name.",
+        )
+        extra_scrub_names: str = Field(
+            default="",
+            description="Comma-separated extra names to scrub from everything sent to Honcho.",
+        )
+        structured_profile: bool = Field(
+            default=True,
+            description="Inject labelled sections: inferred profile, open commitments, inferred traits, facts.",
+        )
+        profile_reasoning_level: str = Field(
+            default="medium", description="Honcho reasoning level for the cached profile query."
+        )
+        profile_refresh_hours: float = Field(default=6.0, description="Max age of the cached profile.")
+        profile_refresh_messages: int = Field(
+            default=30, description="Refresh the cached profile after this many new messages."
         )
         enable_injection: bool = Field(default=True, description="Inject recalled memory.")
         enable_saving: bool = Field(default=True, description="Save messages to Honcho.")
@@ -1068,6 +1527,12 @@ class Filter:
 
     _LRU_MAX = 1024
 
+    # Server-side guardrail pushed once per process per user peer (see _ensure).
+    _PRIVACY_INSTRUCTIONS = (
+        "Never record the user's real personal name. Refer to the user only by their peer "
+        "id. Do not write names, addresses or other direct identifiers onto the peer card."
+    )
+
     def __init__(self) -> None:
         self.valves = self.Valves()
         self._client: Any = None
@@ -1075,6 +1540,9 @@ class Filter:
         self._saved_ids: OrderedDict[str, None] = OrderedDict()
         self._disabled: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
+        self._peer_config_pushed: set[str] = set()
+        self._profiles = ProfileCache()
+        self._profile_inflight: set[str] = set()
 
     # ------------------------------------------------------------------ helpers
     def _get_client(self) -> Any:
@@ -1143,6 +1611,25 @@ class Filter:
             assistant_peer_id(self._model_id(body, model), v.per_model_assistant_peer),
         )
 
+    def _label(self, user: dict) -> str:
+        """Readable label substituted for raw peer ids on every egress path."""
+        return self.valves.user_label.replace("{name}", str(user.get("name") or "") or "the user")
+
+    def _scrub_names(self, user: dict, text: str | None, user_pid: str) -> str:
+        """Replace the user's display name (and configured extras) with their peer id."""
+        display = str(user.get("name") or "").strip()
+        names = [display] + [p for p in display.split() if p]
+        for extra in str(self.valves.extra_scrub_names or "").split(","):
+            if extra.strip():
+                names.append(extra.strip())
+        return scrub_names(text, names, user_pid)
+
+    def _unmask(self, user: dict, user_pid: str, text: str | None) -> str:
+        """Replace raw peer ids (incl. tolerant uuid forms) with the display label."""
+        if not self.valves.mask_peer_id or not text:
+            return text or ""
+        return unmask_peer_ids(text, [user_pid], self._label(user))
+
     @staticmethod
     def _session_peers(user_pid: str, asst_pid: str) -> dict:
         return {
@@ -1153,13 +1640,25 @@ class Filter:
     async def _ensure(
         self, client: Any, user: dict, user_pid: str, asst_pid: str, chat_id: str | None
     ) -> None:
-        """Best-effort get-or-create of workspace, peers and session; never raises."""
-        meta = {"name": user["name"]} if user.get("name") else None
+        """Best-effort get-or-create of workspace, peers and session; never raises.
+
+        No name is ever sent as peer metadata. Once per process per user peer, a
+        privacy configuration (custom_instructions) is pushed to the server so
+        its LLMs never record the user's real name; the push is best effort.
+        """
         steps = [
             lambda: client.ensure_workspace(),
-            lambda: client.ensure_peer(user_pid, metadata=meta),
+            lambda: client.ensure_peer(user_pid),
             lambda: client.ensure_peer(asst_pid),
         ]
+        if user_pid not in self._peer_config_pushed:
+
+            def _push_privacy() -> Any:
+                return client.update_peer(
+                    user_pid, configuration={"custom_instructions": self._PRIVACY_INSTRUCTIONS}
+                )
+
+            steps.append(_push_privacy)
         if chat_id:
             sid = sanitize_id(chat_id)
             steps.append(
@@ -1172,6 +1671,10 @@ class Filter:
                 await step()
             except Exception as exc:  # noqa: BLE001
                 _log.warning("honcho ensure step failed: %s", exc)
+        if user_pid not in self._peer_config_pushed:
+            # Mark pushed even when the call failed: never retry this on every
+            # turn (server-side instructions are a best-effort guardrail).
+            self._peer_config_pushed.add(user_pid)
 
     @staticmethod
     def _last_index(messages: list, role: str) -> int:
@@ -1201,6 +1704,48 @@ class Filter:
     async def _owui_memory_texts(cls, user_id: str) -> list[str]:
         """Open WebUI built-in memory contents for dedupe; [] when unavailable."""
         return [c for c, _ in await cls._owui_memory_items(user_id)]
+
+    async def _refresh_profile(
+        self, client: Any, user: dict, user_pid: str, uid: str, sid: str | None
+    ) -> str:
+        """Ask Honcho's dialectic for a compact profile and cache it. Never raises."""
+        old = self._profiles.get(uid)
+        count = self._profiles.msg_count(uid)
+        text = old
+        try:
+            raw = await asyncio.wait_for(
+                client.chat(
+                    user_pid,
+                    build_profile_prompt(user_pid),
+                    reasoning_level=self.valves.profile_reasoning_level,
+                    session_id=None,
+                ),
+                timeout=90,
+            )
+            fresh = clean_profile_answer(self._unmask(user, user_pid, raw or ""), 300)
+            text = fresh or old
+        except Exception as exc:  # noqa: BLE001 - keep serving the stale profile
+            _log.warning("honcho profile refresh failed: %s", exc, exc_info=self.valves.debug)
+        # Always stamp the time so a failing server is not hammered every turn.
+        self._profiles.put(uid, text, count, time.time())
+        return text
+    def _compose_sections(
+        self, raw_rep: str, facts: str, card: list[str] | None, query: str, uid: str
+    ) -> str:
+        """Build the labelled memory body: profile, open commitments, inferences, facts."""
+        obs = parse_typed_observations(raw_rep or "")
+        commitments = select_commitments(obs)
+        inferences = select_inferences(obs, query, known_texts=list(card or []))
+        # The labelled versions win: drop plain duplicates from the generic facts list.
+        taken = [_tokens(t) for t in commitments + [t for t, _ in inferences]]
+        kept = [
+            ln
+            for ln in (facts or "").splitlines()
+            if ln.strip() and not any(_similar(_tokens(ln.lstrip("- ").strip()), t, 0.6) for t in taken)
+        ]
+        return format_profile_sections(
+            self._profiles.get(uid), commitments, inferences, "\n".join(kept), None
+        )
 
     async def inlet(
         self,
@@ -1242,10 +1787,9 @@ class Filter:
             ctx = ctx if isinstance(ctx, dict) else {}
             rep = ctx.get("representation") if self.valves.inject_representation else None
             card = ctx.get("peer_card") if self.valves.inject_peer_card else None
-            if self.valves.mask_peer_id:
-                label = self.valves.user_label.replace("{name}", str(user.get("name") or "the user"))
-                rep = mask_peer_ids(rep, [user_pid], label) if rep else rep
-                card = [mask_peer_ids(c, [user_pid], label) for c in card] if card else card
+            rep = self._unmask(user, user_pid, rep) if rep else rep
+            card = [self._unmask(user, user_pid, c) for c in card] if card else card
+            raw_rep = rep
             if self.valves.curate_context and rep:
                 known = list(card or [])
                 owui_items: list[tuple[str, str | None]] = []
@@ -1265,11 +1809,33 @@ class Filter:
                     rep = format_grouped_facts(group_by_topic(kept, owui_items), text)
                 else:
                     rep = "\n".join(f"- {k}" for k in kept)
+            fact_count = sum(1 for ln in (rep or "").splitlines() if ln.strip())
+            if self.valves.structured_profile and self.valves.curate_context and raw_rep:
+                self._profiles.bump(uid)
+                if uid not in self._profile_inflight and self._profiles.needs_refresh(
+                    uid,
+                    self._profiles.msg_count(uid),
+                    time.time(),
+                    ttl_seconds=self.valves.profile_refresh_hours * 3600,
+                    every_n_messages=self.valves.profile_refresh_messages,
+                ):
+                    self._profile_inflight.add(uid)
+
+                    async def _bg(u: str = uid) -> None:
+                        try:
+                            await self._refresh_profile(client, user, user_pid, u, None)
+                        finally:
+                            self._profile_inflight.discard(u)
+
+                    task = asyncio.create_task(_bg())
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
+                rep = self._compose_sections(raw_rep, rep or "", card, text, uid)
             header = "Memory about this user"
             if uv.extra_instructions.strip():
                 header += ". " + uv.extra_instructions.strip()
             block = format_memory_block(rep, card, None, self.valves.context_max_chars, header)
-            count = len(card or []) + sum(1 for ln in (rep or "").splitlines() if ln.strip())
+            count = len(card or []) + fact_count
             if block:
                 body["messages"] = inject_into_messages(
                     messages, block, self.valves.inject_position
@@ -1330,7 +1896,7 @@ class Filter:
             return self._rewrite(
                 body, ui, head + "Memory is currently OFF for you. Use `/memory on` to resume."
             )
-        if name not in ("show", "remember", "forget", "ask", "dream"):
+        if name not in ("show", "remember", "forget", "ask", "dream", "profile"):
             return self._rewrite(body, ui, head + f"Unknown command `{name}`.\n\n" + _HELP_TEXT)
 
         try:
@@ -1345,8 +1911,8 @@ class Filter:
                     user_pid, max_conclusions=self.valves.max_conclusions
                 )
                 ctx = ctx if isinstance(ctx, dict) else {}
-                card = ctx.get("peer_card") or []
-                rep = ctx.get("representation") or ""
+                card = [self._unmask(user, user_pid, c) for c in (ctx.get("peer_card") or [])]
+                rep = self._unmask(user, user_pid, ctx.get("representation") or "")
                 if not card and not rep.strip():
                     result = "Nothing is remembered about the user yet."
                 else:
@@ -1369,22 +1935,33 @@ class Filter:
                 )
                 if pend:
                     result += f" There are currently {pend} background work units ahead of it."
+            elif name == "profile":
+                self._profiles.invalidate(uid)
+                prof = await self._refresh_profile(client, user, user_pid, uid, sid)
+                result = (
+                    "Inferred profile (hypotheses from Honcho, may be wrong):\n" + prof
+                    if prof
+                    else "Not enough evidence yet to infer a profile. Keep chatting, or run `/memory dream` once there are more observations."
+                )
             elif name == "remember":
                 if not arg:
                     result = "Usage: `/memory remember <fact>`. No fact was given; nothing stored."
                 else:
-                    await client.create_conclusion(asst_pid, user_pid, arg, session_id=sid)
+                    fact = self._scrub_names(user, arg, user_pid)
+                    await client.create_conclusion(asst_pid, user_pid, fact, session_id=sid)
                     result = f"Stored. Confirm in one short sentence that you will remember: {arg}"
             elif name == "ask":
                 if not arg:
                     result = "Usage: `/memory ask <question>`."
                 else:
+                    question = self._scrub_names(user, arg, user_pid)
                     answer = await client.chat(
-                        user_pid, arg, reasoning_level=uv.reasoning_level, session_id=sid
+                        user_pid, question, reasoning_level=uv.reasoning_level, session_id=sid
                     )
+                    answer = self._unmask(user, user_pid, answer or "")
                     result = f"Memory's answer to the question '{arg}':\n{answer or '(no answer)'}"
             else:  # forget
-                result = await self._forget(client, asst_pid, user_pid, arg)
+                result = self._unmask(user, user_pid, await self._forget(client, asst_pid, user_pid, self._scrub_names(user, arg, user_pid)))
             await self._emit(emitter, uv, "Memory command done", True)
             return self._rewrite(body, ui, head + result)
         except Exception as exc:  # noqa: BLE001
@@ -1393,7 +1970,10 @@ class Filter:
             return self._rewrite(
                 body,
                 ui,
-                head + "The memory service is unavailable right now; the command did not run.",
+                head
+                + self._unmask(
+                    user, user_pid, "The memory service is unavailable right now; the command did not run."
+                ),
             )
 
     async def _forget(self, client: Any, asst_pid: str, user_pid: str, arg: str) -> str:
@@ -1479,6 +2059,7 @@ class Filter:
                 key = self._msg_key(chat_id, msg, text)
                 if key in self._saved_ids:
                     continue
+                text = self._scrub_names(user, text, user_pid)
                 payload = {"peer_id": pid, "content": text}
                 if msg.get("id"):
                     payload["metadata"] = {"owui_message_id": str(msg["id"])}

@@ -86,15 +86,73 @@ def clean_message_for_save(text: str | None, max_chars: int = 4000) -> str:
 def mask_peer_ids(text: str | None, peer_ids: list[str] | tuple[str, ...], label: str) -> str:
     """Replace raw Honcho peer ids (e.g. 'user-<uuid>') with a readable label.
 
-    Honcho's extraction prompts name the user by peer id, which wastes context and
-    reads badly. Longest ids are replaced first; blank ids/labels are no-ops.
+    Backward-compatible thin wrapper around :func:`unmask_peer_ids` (which also
+    handles tolerant/truncated uuid-form ids).
+    """
+    return unmask_peer_ids(text, peer_ids, label)
+
+
+# Ordinary English words that must not be scrubbed when they merely coincide with a
+# single-word name part. Given names are deliberately NOT listed: a user called Sam or
+# Mark must still be masked, because leaking the real name defeats the whole feature.
+_SCRUB_STOPWORDS = frozenset(
+    ["the", "and", "but", "for", "not", "nor", "one", "two", "six", "ten", "all", "any",
+     "few", "own", "too", "very", "yet", "may", "can", "van", "von", "der", "del", "dos"]
+)
+
+
+def scrub_names(text: str | None, names: list[str] | tuple[str, ...], replacement: str) -> str:
+    """Replace whole-word, case-insensitive occurrences of ``names`` with ``replacement``.
+
+    Used for ingress pseudonymization: every mention of the user's display name
+    (full name and its parts) sent to Honcho becomes the user's peer id. Single-word
+    names shorter than 3 chars, or in a small stoplist of common English words, are
+    ignored (multi-word names are always scrubbed) so ordinary text is never mangled. Longer names are replaced first
+    (the full display name before its parts). Blank text/replacement is a no-op.
+    """
+    out = text or ""
+    rep = replacement or ""
+    if not out or not rep:
+        return out
+    cands: set[str] = set()
+    for n in names or []:
+        n = str(n or "").strip()
+        if " " in n or (len(n) >= 3 and n.lower() not in _SCRUB_STOPWORDS):
+            cands.add(n)
+    for n in sorted(cands, key=len, reverse=True):
+        out = re.sub(rf"(?<!\w){re.escape(n)}(?!\w)", rep, out, flags=re.IGNORECASE)
+    return out
+
+
+# Prefix of a uuid-form peer id (everything before the first run of 8 hex chars).
+_PEER_HEX_PREFIX_RE = re.compile(r"^(.*?)(?=[0-9a-f]{8})", re.IGNORECASE)
+# Tolerant uuid tail: full 8-4-4-4-12 form, hyphenless, or truncated (>= 8 hex chars).
+_PEER_UUID_TAIL_RE = r"[0-9a-f]{8}(?:-?[0-9a-f]{4}){0,3}(?:-?[0-9a-f]{12})?"
+
+
+def unmask_peer_ids(text: str | None, peer_ids: list[str] | tuple[str, ...], label: str) -> str:
+    """Replace raw Honcho peer ids in ``text`` with a readable ``label``.
+
+    Matches both the exact peer ids (longest first) and a tolerant form of
+    uuid-style ids — the peer prefix followed by a full, hyphenless or
+    truncated (>= 8 hex chars) uuid, case-insensitive — so the user never sees
+    a raw ``user-<uuid>`` even when Honcho truncates or reformats it. Blank
+    ids/labels are no-ops.
     """
     out = text or ""
     label = (label or "").strip()
-    if not label:
+    if not out or not label:
         return out
-    for pid in sorted({p for p in peer_ids if p}, key=len, reverse=True):
+    pids = {p for p in (peer_ids or []) if p}
+    for pid in sorted(pids, key=len, reverse=True):
         out = out.replace(pid, label)
+    prefixes: set[str] = set()
+    for pid in pids:
+        m = _PEER_HEX_PREFIX_RE.match(pid)
+        if m and m.group(1):
+            prefixes.add(m.group(1))
+    for pre in prefixes:
+        out = re.sub(re.escape(pre) + _PEER_UUID_TAIL_RE, label, out, flags=re.IGNORECASE)
     return out
 
 

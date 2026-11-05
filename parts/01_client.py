@@ -201,6 +201,24 @@ class HonchoClient:
         await self._request("POST", f"{self._ws()}/sessions", json_body=body, retry=True)
         self._remember(self._known_sessions, key)
 
+    async def update_peer(
+        self,
+        peer_id: str,
+        metadata: dict | None = None,
+        configuration: dict | None = None,
+    ) -> None:
+        """Update an existing peer via PUT /v3/workspaces/{ws}/peers/{peer_id}.
+
+        Idempotent (retried on 5xx / transport errors). Used for defense-in-depth
+        server-side rules, e.g. an instruction to never record the user's real name.
+        """
+        body: dict[str, Any] = {}
+        if metadata is not None:
+            body["metadata"] = metadata
+        if configuration is not None:
+            body["configuration"] = configuration
+        await self._request("PUT", self._peer(peer_id), json_body=body, retry=True)
+
     # ------------------------------------------------------------------ messages
     async def add_messages(self, session_id: str, messages: list[dict]) -> list[dict]:
         """Append messages to a session. NEVER retried (would duplicate messages)."""

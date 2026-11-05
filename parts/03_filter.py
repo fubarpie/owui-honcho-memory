@@ -15,6 +15,7 @@ _HELP_TEXT = (
     "- `/memory remember <fact>`: store a fact about you\n"
     "- `/memory forget [text|id]`: find a stored fact and delete it by id\n"
     "- `/memory ask <question>`: ask the memory system a question about you\n"
+    "- `/memory profile`: rebuild and show the inferred profile (interests, style, personality)\n"
     "- `/memory dream`: consolidate memory now (builds the peer card; takes a few minutes)\n"
     "- `/memory off` / `/memory on`: pause or resume memory (in-memory switch only)\n"
     "- `/memory help`: show this help"
@@ -26,6 +27,9 @@ _OFF_LIMITS = (
     "for you, but it does NOT delete anything already stored. For a permanent opt-out, turn off "
     "'enabled' in this filter's user settings (UserValves)."
 )
+
+
+import time
 
 
 class Filter:
@@ -52,8 +56,23 @@ class Filter:
             description="Replace the raw peer id (user-<uuid>) in injected memory with user_label.",
         )
         user_label: str = Field(
-            default="the user",
+            default="{name}",
             description="Label used instead of the peer id. Use '{name}' for the Open WebUI display name.",
+        )
+        extra_scrub_names: str = Field(
+            default="",
+            description="Comma-separated extra names to scrub from everything sent to Honcho.",
+        )
+        structured_profile: bool = Field(
+            default=True,
+            description="Inject labelled sections: inferred profile, open commitments, inferred traits, facts.",
+        )
+        profile_reasoning_level: str = Field(
+            default="medium", description="Honcho reasoning level for the cached profile query."
+        )
+        profile_refresh_hours: float = Field(default=6.0, description="Max age of the cached profile.")
+        profile_refresh_messages: int = Field(
+            default=30, description="Refresh the cached profile after this many new messages."
         )
         enable_injection: bool = Field(default=True, description="Inject recalled memory.")
         enable_saving: bool = Field(default=True, description="Save messages to Honcho.")
@@ -108,6 +127,12 @@ class Filter:
 
     _LRU_MAX = 1024
 
+    # Server-side guardrail pushed once per process per user peer (see _ensure).
+    _PRIVACY_INSTRUCTIONS = (
+        "Never record the user's real personal name. Refer to the user only by their peer "
+        "id. Do not write names, addresses or other direct identifiers onto the peer card."
+    )
+
     def __init__(self) -> None:
         self.valves = self.Valves()
         self._client: Any = None
@@ -115,6 +140,9 @@ class Filter:
         self._saved_ids: OrderedDict[str, None] = OrderedDict()
         self._disabled: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
+        self._peer_config_pushed: set[str] = set()
+        self._profiles = ProfileCache()
+        self._profile_inflight: set[str] = set()
 
     # ------------------------------------------------------------------ helpers
     def _get_client(self) -> Any:
@@ -183,6 +211,25 @@ class Filter:
             assistant_peer_id(self._model_id(body, model), v.per_model_assistant_peer),
         )
 
+    def _label(self, user: dict) -> str:
+        """Readable label substituted for raw peer ids on every egress path."""
+        return self.valves.user_label.replace("{name}", str(user.get("name") or "") or "the user")
+
+    def _scrub_names(self, user: dict, text: str | None, user_pid: str) -> str:
+        """Replace the user's display name (and configured extras) with their peer id."""
+        display = str(user.get("name") or "").strip()
+        names = [display] + [p for p in display.split() if p]
+        for extra in str(self.valves.extra_scrub_names or "").split(","):
+            if extra.strip():
+                names.append(extra.strip())
+        return scrub_names(text, names, user_pid)
+
+    def _unmask(self, user: dict, user_pid: str, text: str | None) -> str:
+        """Replace raw peer ids (incl. tolerant uuid forms) with the display label."""
+        if not self.valves.mask_peer_id or not text:
+            return text or ""
+        return unmask_peer_ids(text, [user_pid], self._label(user))
+
     @staticmethod
     def _session_peers(user_pid: str, asst_pid: str) -> dict:
         return {
@@ -193,13 +240,25 @@ class Filter:
     async def _ensure(
         self, client: Any, user: dict, user_pid: str, asst_pid: str, chat_id: str | None
     ) -> None:
-        """Best-effort get-or-create of workspace, peers and session; never raises."""
-        meta = {"name": user["name"]} if user.get("name") else None
+        """Best-effort get-or-create of workspace, peers and session; never raises.
+
+        No name is ever sent as peer metadata. Once per process per user peer, a
+        privacy configuration (custom_instructions) is pushed to the server so
+        its LLMs never record the user's real name; the push is best effort.
+        """
         steps = [
             lambda: client.ensure_workspace(),
-            lambda: client.ensure_peer(user_pid, metadata=meta),
+            lambda: client.ensure_peer(user_pid),
             lambda: client.ensure_peer(asst_pid),
         ]
+        if user_pid not in self._peer_config_pushed:
+
+            def _push_privacy() -> Any:
+                return client.update_peer(
+                    user_pid, configuration={"custom_instructions": self._PRIVACY_INSTRUCTIONS}
+                )
+
+            steps.append(_push_privacy)
         if chat_id:
             sid = sanitize_id(chat_id)
             steps.append(
@@ -212,6 +271,10 @@ class Filter:
                 await step()
             except Exception as exc:  # noqa: BLE001
                 _log.warning("honcho ensure step failed: %s", exc)
+        if user_pid not in self._peer_config_pushed:
+            # Mark pushed even when the call failed: never retry this on every
+            # turn (server-side instructions are a best-effort guardrail).
+            self._peer_config_pushed.add(user_pid)
 
     @staticmethod
     def _last_index(messages: list, role: str) -> int:
@@ -241,6 +304,48 @@ class Filter:
     async def _owui_memory_texts(cls, user_id: str) -> list[str]:
         """Open WebUI built-in memory contents for dedupe; [] when unavailable."""
         return [c for c, _ in await cls._owui_memory_items(user_id)]
+
+    async def _refresh_profile(
+        self, client: Any, user: dict, user_pid: str, uid: str, sid: str | None
+    ) -> str:
+        """Ask Honcho's dialectic for a compact profile and cache it. Never raises."""
+        old = self._profiles.get(uid)
+        count = self._profiles.msg_count(uid)
+        text = old
+        try:
+            raw = await asyncio.wait_for(
+                client.chat(
+                    user_pid,
+                    build_profile_prompt(user_pid),
+                    reasoning_level=self.valves.profile_reasoning_level,
+                    session_id=None,
+                ),
+                timeout=90,
+            )
+            fresh = clean_profile_answer(self._unmask(user, user_pid, raw or ""), 300)
+            text = fresh or old
+        except Exception as exc:  # noqa: BLE001 - keep serving the stale profile
+            _log.warning("honcho profile refresh failed: %s", exc, exc_info=self.valves.debug)
+        # Always stamp the time so a failing server is not hammered every turn.
+        self._profiles.put(uid, text, count, time.time())
+        return text
+    def _compose_sections(
+        self, raw_rep: str, facts: str, card: list[str] | None, query: str, uid: str
+    ) -> str:
+        """Build the labelled memory body: profile, open commitments, inferences, facts."""
+        obs = parse_typed_observations(raw_rep or "")
+        commitments = select_commitments(obs)
+        inferences = select_inferences(obs, query, known_texts=list(card or []))
+        # The labelled versions win: drop plain duplicates from the generic facts list.
+        taken = [_tokens(t) for t in commitments + [t for t, _ in inferences]]
+        kept = [
+            ln
+            for ln in (facts or "").splitlines()
+            if ln.strip() and not any(_similar(_tokens(ln.lstrip("- ").strip()), t, 0.6) for t in taken)
+        ]
+        return format_profile_sections(
+            self._profiles.get(uid), commitments, inferences, "\n".join(kept), None
+        )
 
     async def inlet(
         self,
@@ -282,10 +387,9 @@ class Filter:
             ctx = ctx if isinstance(ctx, dict) else {}
             rep = ctx.get("representation") if self.valves.inject_representation else None
             card = ctx.get("peer_card") if self.valves.inject_peer_card else None
-            if self.valves.mask_peer_id:
-                label = self.valves.user_label.replace("{name}", str(user.get("name") or "the user"))
-                rep = mask_peer_ids(rep, [user_pid], label) if rep else rep
-                card = [mask_peer_ids(c, [user_pid], label) for c in card] if card else card
+            rep = self._unmask(user, user_pid, rep) if rep else rep
+            card = [self._unmask(user, user_pid, c) for c in card] if card else card
+            raw_rep = rep
             if self.valves.curate_context and rep:
                 known = list(card or [])
                 owui_items: list[tuple[str, str | None]] = []
@@ -305,11 +409,33 @@ class Filter:
                     rep = format_grouped_facts(group_by_topic(kept, owui_items), text)
                 else:
                     rep = "\n".join(f"- {k}" for k in kept)
+            fact_count = sum(1 for ln in (rep or "").splitlines() if ln.strip())
+            if self.valves.structured_profile and self.valves.curate_context and raw_rep:
+                self._profiles.bump(uid)
+                if uid not in self._profile_inflight and self._profiles.needs_refresh(
+                    uid,
+                    self._profiles.msg_count(uid),
+                    time.time(),
+                    ttl_seconds=self.valves.profile_refresh_hours * 3600,
+                    every_n_messages=self.valves.profile_refresh_messages,
+                ):
+                    self._profile_inflight.add(uid)
+
+                    async def _bg(u: str = uid) -> None:
+                        try:
+                            await self._refresh_profile(client, user, user_pid, u, None)
+                        finally:
+                            self._profile_inflight.discard(u)
+
+                    task = asyncio.create_task(_bg())
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
+                rep = self._compose_sections(raw_rep, rep or "", card, text, uid)
             header = "Memory about this user"
             if uv.extra_instructions.strip():
                 header += ". " + uv.extra_instructions.strip()
             block = format_memory_block(rep, card, None, self.valves.context_max_chars, header)
-            count = len(card or []) + sum(1 for ln in (rep or "").splitlines() if ln.strip())
+            count = len(card or []) + fact_count
             if block:
                 body["messages"] = inject_into_messages(
                     messages, block, self.valves.inject_position
@@ -370,7 +496,7 @@ class Filter:
             return self._rewrite(
                 body, ui, head + "Memory is currently OFF for you. Use `/memory on` to resume."
             )
-        if name not in ("show", "remember", "forget", "ask", "dream"):
+        if name not in ("show", "remember", "forget", "ask", "dream", "profile"):
             return self._rewrite(body, ui, head + f"Unknown command `{name}`.\n\n" + _HELP_TEXT)
 
         try:
@@ -385,8 +511,8 @@ class Filter:
                     user_pid, max_conclusions=self.valves.max_conclusions
                 )
                 ctx = ctx if isinstance(ctx, dict) else {}
-                card = ctx.get("peer_card") or []
-                rep = ctx.get("representation") or ""
+                card = [self._unmask(user, user_pid, c) for c in (ctx.get("peer_card") or [])]
+                rep = self._unmask(user, user_pid, ctx.get("representation") or "")
                 if not card and not rep.strip():
                     result = "Nothing is remembered about the user yet."
                 else:
@@ -409,22 +535,33 @@ class Filter:
                 )
                 if pend:
                     result += f" There are currently {pend} background work units ahead of it."
+            elif name == "profile":
+                self._profiles.invalidate(uid)
+                prof = await self._refresh_profile(client, user, user_pid, uid, sid)
+                result = (
+                    "Inferred profile (hypotheses from Honcho, may be wrong):\n" + prof
+                    if prof
+                    else "Not enough evidence yet to infer a profile. Keep chatting, or run `/memory dream` once there are more observations."
+                )
             elif name == "remember":
                 if not arg:
                     result = "Usage: `/memory remember <fact>`. No fact was given; nothing stored."
                 else:
-                    await client.create_conclusion(asst_pid, user_pid, arg, session_id=sid)
+                    fact = self._scrub_names(user, arg, user_pid)
+                    await client.create_conclusion(asst_pid, user_pid, fact, session_id=sid)
                     result = f"Stored. Confirm in one short sentence that you will remember: {arg}"
             elif name == "ask":
                 if not arg:
                     result = "Usage: `/memory ask <question>`."
                 else:
+                    question = self._scrub_names(user, arg, user_pid)
                     answer = await client.chat(
-                        user_pid, arg, reasoning_level=uv.reasoning_level, session_id=sid
+                        user_pid, question, reasoning_level=uv.reasoning_level, session_id=sid
                     )
+                    answer = self._unmask(user, user_pid, answer or "")
                     result = f"Memory's answer to the question '{arg}':\n{answer or '(no answer)'}"
             else:  # forget
-                result = await self._forget(client, asst_pid, user_pid, arg)
+                result = self._unmask(user, user_pid, await self._forget(client, asst_pid, user_pid, self._scrub_names(user, arg, user_pid)))
             await self._emit(emitter, uv, "Memory command done", True)
             return self._rewrite(body, ui, head + result)
         except Exception as exc:  # noqa: BLE001
@@ -433,7 +570,10 @@ class Filter:
             return self._rewrite(
                 body,
                 ui,
-                head + "The memory service is unavailable right now; the command did not run.",
+                head
+                + self._unmask(
+                    user, user_pid, "The memory service is unavailable right now; the command did not run."
+                ),
             )
 
     async def _forget(self, client: Any, asst_pid: str, user_pid: str, arg: str) -> str:
@@ -519,6 +659,7 @@ class Filter:
                 key = self._msg_key(chat_id, msg, text)
                 if key in self._saved_ids:
                     continue
+                text = self._scrub_names(user, text, user_pid)
                 payload = {"peer_id": pid, "content": text}
                 if msg.get("id"):
                     payload["metadata"] = {"owui_message_id": str(msg["id"])}
