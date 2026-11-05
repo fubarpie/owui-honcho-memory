@@ -1,0 +1,26 @@
+[project]
+name = "owui-honcho-memory"
+version = "0.1.0"
+description = "Open WebUI filter giving chats persistent, reasoning-based memory via Honcho (https://honcho.dev)."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "fubarpie" }]
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["dist"]
+
+[tool.ruff.lint.per-file-ignores]
+# parts are concatenated into one namespace by build.py, so cross-part names look undefined
+"parts/*.py" = ["F821"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "live: tests that need a real Honcho server (deselected by default)",
+]
+asyncio_default_fixture_loop_scope = "function"
+addopts = '-m "not live"'
