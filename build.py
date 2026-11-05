@@ -16,7 +16,8 @@ for f in files:
     keep = []
     for ln in lines:
         if re.match(r"^(import |from \S+ import )", ln):
-            if ln not in imports: imports.append(ln)
+            if ln not in imports:
+                imports.append(ln)
         else:
             keep.append(ln)
     bodies.append(f"# ---- {f.name} ----\n" + "\n".join(keep).strip("\n") + "\n")
