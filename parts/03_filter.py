@@ -46,6 +46,14 @@ class Filter:
             default=True, description="One assistant peer per model (else a single 'assistant')."
         )
         inject_position: str = Field(default="system", description="'system' or 'user'.")
+        mask_peer_id: bool = Field(
+            default=True,
+            description="Replace the raw peer id (user-<uuid>) in injected memory with user_label.",
+        )
+        user_label: str = Field(
+            default="the user",
+            description="Label used instead of the peer id. Use '{name}' for the Open WebUI display name.",
+        )
         enable_injection: bool = Field(default=True, description="Inject recalled memory.")
         enable_saving: bool = Field(default=True, description="Save messages to Honcho.")
         inject_peer_card: bool = Field(default=True, description="Include the peer card.")
@@ -232,6 +240,10 @@ class Filter:
             ctx = ctx if isinstance(ctx, dict) else {}
             rep = ctx.get("representation") if self.valves.inject_representation else None
             card = ctx.get("peer_card") if self.valves.inject_peer_card else None
+            if self.valves.mask_peer_id:
+                label = self.valves.user_label.replace("{name}", str(user.get("name") or "the user"))
+                rep = mask_peer_ids(rep, [user_pid], label) if rep else rep
+                card = [mask_peer_ids(c, [user_pid], label) for c in card] if card else card
             header = "Memory about this user"
             if uv.extra_instructions.strip():
                 header += ". " + uv.extra_instructions.strip()

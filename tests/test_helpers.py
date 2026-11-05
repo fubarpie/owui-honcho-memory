@@ -361,3 +361,20 @@ def test_should_skip_does_not_mutate():
     snap = copy.deepcopy(b)
     h.should_skip(b, USER, V)
     assert b == snap
+
+
+def test_mask_peer_ids():
+    pid = "user-abc-123"
+    assert h.mask_peer_ids(f"{pid} likes tea. {pid} has a dog.", [pid], "the user") == "the user likes tea. the user has a dog."
+    assert h.mask_peer_ids(f"{pid}", [pid], "Keenan") == "Keenan"
+
+
+def test_mask_peer_ids_noops():
+    assert h.mask_peer_ids(None, ["x"], "the user") == ""
+    assert h.mask_peer_ids("user-1 hi", [], "the user") == "user-1 hi"
+    assert h.mask_peer_ids("user-1 hi", ["user-1"], "") == "user-1 hi"
+    assert h.mask_peer_ids("user-1 hi", [""], "u") == "user-1 hi"
+
+
+def test_mask_peer_ids_longest_first():
+    assert h.mask_peer_ids("user-12 and user-1", ["user-1", "user-12"], "U") == "U and U"

@@ -466,6 +466,21 @@ def clean_message_for_save(text: str | None, max_chars: int = 4000) -> str:
     return out
 
 
+def mask_peer_ids(text: str | None, peer_ids: list[str] | tuple[str, ...], label: str) -> str:
+    """Replace raw Honcho peer ids (e.g. 'user-<uuid>') with a readable label.
+
+    Honcho's extraction prompts name the user by peer id, which wastes context and
+    reads badly. Longest ids are replaced first; blank ids/labels are no-ops.
+    """
+    out = text or ""
+    label = (label or "").strip()
+    if not label:
+        return out
+    for pid in sorted({p for p in peer_ids if p}, key=len, reverse=True):
+        out = out.replace(pid, label)
+    return out
+
+
 def format_memory_block(
     representation: str | None,
     card: list[str] | None,
@@ -698,6 +713,14 @@ class Filter:
             default=True, description="One assistant peer per model (else a single 'assistant')."
         )
         inject_position: str = Field(default="system", description="'system' or 'user'.")
+        mask_peer_id: bool = Field(
+            default=True,
+            description="Replace the raw peer id (user-<uuid>) in injected memory with user_label.",
+        )
+        user_label: str = Field(
+            default="the user",
+            description="Label used instead of the peer id. Use '{name}' for the Open WebUI display name.",
+        )
         enable_injection: bool = Field(default=True, description="Inject recalled memory.")
         enable_saving: bool = Field(default=True, description="Save messages to Honcho.")
         inject_peer_card: bool = Field(default=True, description="Include the peer card.")
@@ -884,6 +907,10 @@ class Filter:
             ctx = ctx if isinstance(ctx, dict) else {}
             rep = ctx.get("representation") if self.valves.inject_representation else None
             card = ctx.get("peer_card") if self.valves.inject_peer_card else None
+            if self.valves.mask_peer_id:
+                label = self.valves.user_label.replace("{name}", str(user.get("name") or "the user"))
+                rep = mask_peer_ids(rep, [user_pid], label) if rep else rep
+                card = [mask_peer_ids(c, [user_pid], label) for c in card] if card else card
             header = "Memory about this user"
             if uv.extra_instructions.strip():
                 header += ". " + uv.extra_instructions.strip()

@@ -82,6 +82,21 @@ def clean_message_for_save(text: str | None, max_chars: int = 4000) -> str:
     return out
 
 
+def mask_peer_ids(text: str | None, peer_ids: list[str] | tuple[str, ...], label: str) -> str:
+    """Replace raw Honcho peer ids (e.g. 'user-<uuid>') with a readable label.
+
+    Honcho's extraction prompts name the user by peer id, which wastes context and
+    reads badly. Longest ids are replaced first; blank ids/labels are no-ops.
+    """
+    out = text or ""
+    label = (label or "").strip()
+    if not label:
+        return out
+    for pid in sorted({p for p in peer_ids if p}, key=len, reverse=True):
+        out = out.replace(pid, label)
+    return out
+
+
 def format_memory_block(
     representation: str | None,
     card: list[str] | None,
