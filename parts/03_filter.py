@@ -77,6 +77,10 @@ class Filter:
             default=True,
             description="Skip Honcho facts already stored in Open WebUI's built-in memory.",
         )
+        group_by_topic: bool = Field(
+            default=True,
+            description="Group injected observations under topic paths (like Open WebUI memory paths).",
+        )
         search_top_k: int = Field(default=10, description="Candidates shown for /memory forget.")
         max_conclusions: int = Field(default=25, description="Max conclusions fetched per turn.")
         save_assistant_messages: bool = Field(
@@ -219,15 +223,24 @@ class Filter:
 
     # ------------------------------------------------------------------ inlet
     @staticmethod
-    async def _owui_memory_texts(user_id: str) -> list[str]:
-        """Open WebUI built-in memory contents for dedupe; [] when unavailable."""
+    async def _owui_memory_items(user_id: str) -> list[tuple[str, str | None]]:
+        """Open WebUI built-in memories as (content, path|None); [] when unavailable."""
         try:
             from open_webui.models.memories import Memories  # type: ignore
 
             mems = await asyncio.to_thread(Memories.get_memories_by_user_id, user_id)
-            return [m.content for m in (mems or []) if getattr(m, "content", None)]
+            return [
+                (m.content, getattr(m, "path", None))
+                for m in (mems or [])
+                if getattr(m, "content", None)
+            ]
         except Exception:  # noqa: BLE001 - optional integration
             return []
+
+    @classmethod
+    async def _owui_memory_texts(cls, user_id: str) -> list[str]:
+        """Open WebUI built-in memory contents for dedupe; [] when unavailable."""
+        return [c for c, _ in await cls._owui_memory_items(user_id)]
 
     async def inlet(
         self,
@@ -275,8 +288,11 @@ class Filter:
                 card = [mask_peer_ids(c, [user_pid], label) for c in card] if card else card
             if self.valves.curate_context and rep:
                 known = list(card or [])
+                owui_items: list[tuple[str, str | None]] = []
+                if self.valves.dedupe_owui_memories or self.valves.group_by_topic:
+                    owui_items = await self._owui_memory_items(uid)
                 if self.valves.dedupe_owui_memories:
-                    known += await self._owui_memory_texts(uid)
+                    known += [c for c, _ in owui_items]
                 kept = curate_observations(
                     rep,
                     text,
@@ -285,7 +301,10 @@ class Filter:
                     max_age_days=self.valves.observation_max_age_days,
                     always_keep=self.valves.always_include_durable,
                 )
-                rep = "\n".join(f"- {k}" for k in kept)
+                if self.valves.group_by_topic:
+                    rep = format_grouped_facts(group_by_topic(kept, owui_items), text)
+                else:
+                    rep = "\n".join(f"- {k}" for k in kept)
             header = "Memory about this user"
             if uv.extra_instructions.strip():
                 header += ". " + uv.extra_instructions.strip()
