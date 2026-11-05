@@ -832,6 +832,89 @@ def curate_observations(
     return kept
 
 
+# --------------------------------------------------------------------------- topic grouping
+# Default topic paths, mirroring the style of Open WebUI memory paths. Matched by keyword.
+DEFAULT_TOPIC_RULES: tuple[tuple[str, frozenset[str]], ...] = (
+    ("homelab", frozenset(["proxmox", "lxc", "homelab", "casaos", "docker", "vm", "container", "nas", "ntfy", "webhook", "selfhosted"])),
+    ("devices", frozenset(["laptop", "phone", "android", "fedora", "secureblue", "linux", "desktop", "device"])),
+    ("work", frozenset(["job", "jobs", "lincare", "manager", "career", "employer"])),
+    ("home", frozenset(["airbnb", "hostex", "rental", "guests", "address"])),
+    (
+        "projects/open-webui",
+        frozenset(["openwebui", "open-webui", "filter", "tool", "honcho", "handoff", "plugin", "memory", "function"]),
+    ),
+    ("projects", frozenset(["repo", "github", "pr", "merge", "roadmap", "project", "build", "app"])),
+)
+_GENERAL_PATH = "general"
+
+
+def classify_topic(
+    text: str,
+    owui_memories: list[tuple[str, str | None]] | None = None,
+    rules: tuple[tuple[str, frozenset[str]], ...] = DEFAULT_TOPIC_RULES,
+) -> str:
+    """Pick a topic path for one fact.
+
+    1. Best token overlap with an Open WebUI memory that has a path (so facts land under the
+       paths the user already uses, e.g. ``projects/riffle-accounting``).
+    2. Else the keyword rule with most hits (ties -> earlier rule).
+    3. Else ``general``.
+    """
+    tok = _tokens(text)
+    best_path, best = None, 0.0
+    for content, path in owui_memories or []:
+        if not path:
+            continue
+        mt = _tokens(content) | _tokens(path.replace("/", " ").replace("-", " "))
+        if not mt:
+            continue
+        overlap = len(tok & mt)
+        score = overlap / max(len(tok), 1)
+        if overlap >= 2 and score > best:
+            best_path, best = path, score
+    if best_path and best >= 0.25:
+        return best_path
+    hits_best, rule_path = 0, None
+    for path, kws in rules:
+        hits = len(tok & kws)
+        if hits > hits_best:
+            hits_best, rule_path = hits, path
+    return rule_path or _GENERAL_PATH
+
+
+def group_by_topic(
+    facts: list[str],
+    owui_memories: list[tuple[str, str | None]] | None = None,
+) -> dict[str, list[str]]:
+    """Group fact lines by topic path, preserving input (relevance) order within and across groups."""
+    groups: dict[str, list[str]] = {}
+    for f in facts:
+        groups.setdefault(classify_topic(f, owui_memories), []).append(f)
+    return groups
+
+
+def format_grouped_facts(groups: dict[str, list[str]], query: str | None = None) -> str:
+    """Render ``{path: [facts]}`` as ``path:`` headings with bullet items.
+
+    Groups whose path words overlap the query come first; otherwise first-seen order is kept.
+    A lone ``general`` group is rendered flat (a heading adds tokens but no information).
+    """
+    if not groups:
+        return ""
+    if list(groups) == [_GENERAL_PATH]:
+        return "\n".join(f"- {f}" for f in groups[_GENERAL_PATH])
+    qtok = _tokens(query or "")
+    order = sorted(
+        groups,
+        key=lambda p: (-len(qtok & _tokens(p.replace("/", " ").replace("-", " "))), list(groups).index(p)),
+    )
+    lines: list[str] = []
+    for p in order:
+        lines.append(f"{p}:")
+        lines.extend(f"- {f}" for f in groups[p])
+    return "\n".join(lines)
+
+
 # ---- 03_filter.py ----
 _log = logging.getLogger("honcho_memory")
 
@@ -902,6 +985,10 @@ class Filter:
         dedupe_owui_memories: bool = Field(
             default=True,
             description="Skip Honcho facts already stored in Open WebUI's built-in memory.",
+        )
+        group_by_topic: bool = Field(
+            default=True,
+            description="Group injected observations under topic paths (like Open WebUI memory paths).",
         )
         search_top_k: int = Field(default=10, description="Candidates shown for /memory forget.")
         max_conclusions: int = Field(default=25, description="Max conclusions fetched per turn.")
@@ -1045,15 +1132,24 @@ class Filter:
 
     # ------------------------------------------------------------------ inlet
     @staticmethod
-    async def _owui_memory_texts(user_id: str) -> list[str]:
-        """Open WebUI built-in memory contents for dedupe; [] when unavailable."""
+    async def _owui_memory_items(user_id: str) -> list[tuple[str, str | None]]:
+        """Open WebUI built-in memories as (content, path|None); [] when unavailable."""
         try:
             from open_webui.models.memories import Memories  # type: ignore
 
             mems = await asyncio.to_thread(Memories.get_memories_by_user_id, user_id)
-            return [m.content for m in (mems or []) if getattr(m, "content", None)]
+            return [
+                (m.content, getattr(m, "path", None))
+                for m in (mems or [])
+                if getattr(m, "content", None)
+            ]
         except Exception:  # noqa: BLE001 - optional integration
             return []
+
+    @classmethod
+    async def _owui_memory_texts(cls, user_id: str) -> list[str]:
+        """Open WebUI built-in memory contents for dedupe; [] when unavailable."""
+        return [c for c, _ in await cls._owui_memory_items(user_id)]
 
     async def inlet(
         self,
@@ -1101,8 +1197,11 @@ class Filter:
                 card = [mask_peer_ids(c, [user_pid], label) for c in card] if card else card
             if self.valves.curate_context and rep:
                 known = list(card or [])
+                owui_items: list[tuple[str, str | None]] = []
+                if self.valves.dedupe_owui_memories or self.valves.group_by_topic:
+                    owui_items = await self._owui_memory_items(uid)
                 if self.valves.dedupe_owui_memories:
-                    known += await self._owui_memory_texts(uid)
+                    known += [c for c, _ in owui_items]
                 kept = curate_observations(
                     rep,
                     text,
@@ -1111,7 +1210,10 @@ class Filter:
                     max_age_days=self.valves.observation_max_age_days,
                     always_keep=self.valves.always_include_durable,
                 )
-                rep = "\n".join(f"- {k}" for k in kept)
+                if self.valves.group_by_topic:
+                    rep = format_grouped_facts(group_by_topic(kept, owui_items), text)
+                else:
+                    rep = "\n".join(f"- {k}" for k in kept)
             header = "Memory about this user"
             if uv.extra_instructions.strip():
                 header += ". " + uv.extra_instructions.strip()

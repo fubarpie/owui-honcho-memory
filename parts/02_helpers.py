@@ -446,3 +446,86 @@ def curate_observations(
         kept.append(_compact(c["text"]))
         used += cost
     return kept
+
+
+# --------------------------------------------------------------------------- topic grouping
+# Default topic paths, mirroring the style of Open WebUI memory paths. Matched by keyword.
+DEFAULT_TOPIC_RULES: tuple[tuple[str, frozenset[str]], ...] = (
+    ("homelab", frozenset(["proxmox", "lxc", "homelab", "casaos", "docker", "vm", "container", "nas", "ntfy", "webhook", "selfhosted"])),
+    ("devices", frozenset(["laptop", "phone", "android", "fedora", "secureblue", "linux", "desktop", "device"])),
+    ("work", frozenset(["job", "jobs", "lincare", "manager", "career", "employer"])),
+    ("home", frozenset(["airbnb", "hostex", "rental", "guests", "address"])),
+    (
+        "projects/open-webui",
+        frozenset(["openwebui", "open-webui", "filter", "tool", "honcho", "handoff", "plugin", "memory", "function"]),
+    ),
+    ("projects", frozenset(["repo", "github", "pr", "merge", "roadmap", "project", "build", "app"])),
+)
+_GENERAL_PATH = "general"
+
+
+def classify_topic(
+    text: str,
+    owui_memories: list[tuple[str, str | None]] | None = None,
+    rules: tuple[tuple[str, frozenset[str]], ...] = DEFAULT_TOPIC_RULES,
+) -> str:
+    """Pick a topic path for one fact.
+
+    1. Best token overlap with an Open WebUI memory that has a path (so facts land under the
+       paths the user already uses, e.g. ``projects/riffle-accounting``).
+    2. Else the keyword rule with most hits (ties -> earlier rule).
+    3. Else ``general``.
+    """
+    tok = _tokens(text)
+    best_path, best = None, 0.0
+    for content, path in owui_memories or []:
+        if not path:
+            continue
+        mt = _tokens(content) | _tokens(path.replace("/", " ").replace("-", " "))
+        if not mt:
+            continue
+        overlap = len(tok & mt)
+        score = overlap / max(len(tok), 1)
+        if overlap >= 2 and score > best:
+            best_path, best = path, score
+    if best_path and best >= 0.25:
+        return best_path
+    hits_best, rule_path = 0, None
+    for path, kws in rules:
+        hits = len(tok & kws)
+        if hits > hits_best:
+            hits_best, rule_path = hits, path
+    return rule_path or _GENERAL_PATH
+
+
+def group_by_topic(
+    facts: list[str],
+    owui_memories: list[tuple[str, str | None]] | None = None,
+) -> dict[str, list[str]]:
+    """Group fact lines by topic path, preserving input (relevance) order within and across groups."""
+    groups: dict[str, list[str]] = {}
+    for f in facts:
+        groups.setdefault(classify_topic(f, owui_memories), []).append(f)
+    return groups
+
+
+def format_grouped_facts(groups: dict[str, list[str]], query: str | None = None) -> str:
+    """Render ``{path: [facts]}`` as ``path:`` headings with bullet items.
+
+    Groups whose path words overlap the query come first; otherwise first-seen order is kept.
+    A lone ``general`` group is rendered flat (a heading adds tokens but no information).
+    """
+    if not groups:
+        return ""
+    if list(groups) == [_GENERAL_PATH]:
+        return "\n".join(f"- {f}" for f in groups[_GENERAL_PATH])
+    qtok = _tokens(query or "")
+    order = sorted(
+        groups,
+        key=lambda p: (-len(qtok & _tokens(p.replace("/", " ").replace("-", " "))), list(groups).index(p)),
+    )
+    lines: list[str] = []
+    for p in order:
+        lines.append(f"{p}:")
+        lines.extend(f"- {f}" for f in groups[p])
+    return "\n".join(lines)
