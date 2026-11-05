@@ -67,6 +67,10 @@ class FakeClient:
         self._rec("queue_status")
         return {"pending_work_units": 3, "in_progress_work_units": 1}
 
+    async def update_peer(self, peer_id, metadata=None, configuration=None):
+        self._rec("update_peer", peer_id, metadata, configuration)
+        return {}
+
     async def create_conclusion(self, observer_id, observed_id, content, session_id=None):
         self._rec("create_conclusion", observer_id, observed_id, content, session_id)
 
@@ -139,12 +143,12 @@ async def test_inlet_injects_and_is_idempotent():
     assert b2["messages"] == once["messages"]
 
 
-async def test_inlet_sets_user_name_metadata_and_session():
+async def test_inlet_ensures_peers_without_name_metadata_and_session():
     fake = FakeClient()
     f = make(fake)
     await f.inlet(body(), __user__=USER)
     peers = [c for c in fake.calls if c[0] == "ensure_peer"]
-    assert peers[0][2]["metadata"] == {"name": "Sam"}
+    assert peers[0][2]["metadata"] is None  # never leak the display name to Honcho
     assert peers[0][1][0] == "user-u1"
     assert "ensure_session" in fake.names()
 
@@ -375,3 +379,35 @@ async def test_command_dream_failure_degrades():
     f = make(FakeClient(fail=True))
     out = await f.inlet(body("/memory dream"), __user__=USER)
     assert "unavailable" in out["messages"][-1]["content"]
+
+
+async def test_structured_sections_reach_the_model_and_commitments_are_always_injected():
+    rep = (
+        "## Explicit Observations\n"
+        "[2026-11-01 08:00] the user promised Sam the logo files by Friday.\n"
+        "[2026-11-02 08:00] the user likes tea.\n"
+        "## Deductive Observations\n"
+        "[2026-11-03 08:00] the user prefers self-hosted open source software.\n"
+        "   Premises:\n   - runs a homelab\n   - uses Proxmox\n"
+    )
+    f, em = make(), Emitter()
+    f._get_client().ctx["representation"] = rep
+    b = await f.inlet(body(), __user__=USER, __event_emitter__=em)  # unrelated query: 'hello'
+    await drain(f)
+    sys_text = system_text(b)
+    assert "romised Sam the logo files" in sys_text  # commitment injected despite unrelated query
+    assert "inferred from 2 observations" in sys_text  # honest evidence label
+    assert "user-" not in sys_text
+    assert sys_text.count("self-hosted open source") == 1  # labelled inference, not duplicated in facts
+
+
+async def test_memory_profile_command_refreshes_and_unmasks():
+    f = make()
+    client = f._get_client()
+    async def _chat(peer_id, query, reasoning_level="low", session_id=None):
+        return "- user-u1 prefers concise answers\n- Enjoys self-hosting (tentative)"
+
+    client.chat = _chat
+    b = await f.inlet(body("/memory profile"), __user__=USER, __event_emitter__=Emitter())
+    out = " ".join(str(m["content"]) for m in b["messages"])
+    assert "self-hosting" in out and "user-u1" not in out
