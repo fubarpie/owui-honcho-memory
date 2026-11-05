@@ -39,7 +39,7 @@ class FakeClient:
 
     def _rec(self, name, *a, **k):
         self.calls.append((name, a, k))
-        if self.fail and name in ("get_peer_context", "add_messages", "create_conclusion", "chat"):
+        if self.fail and name in ("get_peer_context", "add_messages", "create_conclusion", "chat", "schedule_dream"):
             raise mod.HonchoError("boom")
 
     async def ensure_workspace(self):
@@ -59,6 +59,13 @@ class FakeClient:
     async def get_peer_context(self, peer_id, search_query=None, max_conclusions=25, target=None):
         self._rec("get_peer_context", peer_id, search_query=search_query)
         return self.ctx
+
+    async def schedule_dream(self, observer, observed=None, session_id=None):
+        self._rec("schedule_dream", observer, observed=observed)
+
+    async def queue_status(self):
+        self._rec("queue_status")
+        return {"pending_work_units": 3, "in_progress_work_units": 1}
 
     async def create_conclusion(self, observer_id, observed_id, content, session_id=None):
         self._rec("create_conclusion", observer_id, observed_id, content, session_id)
@@ -353,3 +360,18 @@ async def test_client_rebuilt_when_valves_change():
     assert c2 is not c1
     f.valves.workspace_id = "ws2"
     assert f._get_client() is not c2
+
+
+async def test_command_dream_schedules_and_reports_queue():
+    fake = FakeClient()
+    f = make(fake)
+    out = await f.inlet(body("/memory dream"), __user__=USER)
+    assert ("schedule_dream", ("user-u1",), {"observed": "user-u1"}) in fake.calls
+    content = out["messages"][-1]["content"]
+    assert "scheduled" in content and "4 background work units" in content
+
+
+async def test_command_dream_failure_degrades():
+    f = make(FakeClient(fail=True))
+    out = await f.inlet(body("/memory dream"), __user__=USER)
+    assert "unavailable" in out["messages"][-1]["content"]

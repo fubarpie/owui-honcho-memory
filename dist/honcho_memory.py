@@ -682,6 +682,7 @@ _HELP_TEXT = (
     "- `/memory remember <fact>`: store a fact about you\n"
     "- `/memory forget [text|id]`: find a stored fact and delete it by id\n"
     "- `/memory ask <question>`: ask the memory system a question about you\n"
+    "- `/memory dream`: consolidate memory now (builds the peer card; takes a few minutes)\n"
     "- `/memory off` / `/memory on`: pause or resume memory (in-memory switch only)\n"
     "- `/memory help`: show this help"
 )
@@ -976,7 +977,7 @@ class Filter:
             return self._rewrite(
                 body, ui, head + "Memory is currently OFF for you. Use `/memory on` to resume."
             )
-        if name not in ("show", "remember", "forget", "ask"):
+        if name not in ("show", "remember", "forget", "ask", "dream"):
             return self._rewrite(body, ui, head + f"Unknown command `{name}`.\n\n" + _HELP_TEXT)
 
         try:
@@ -1001,6 +1002,20 @@ class Filter:
                     )
                     result += "\n\nRepresentation:\n" + (rep.strip() or "(empty)")
                     result = "Display this memory to the user as-is.\n" + result
+            elif name == "dream":
+                await client.schedule_dream(user_pid, observed=user_pid)
+                try:
+                    qs = await client.queue_status()
+                except Exception:  # noqa: BLE001 - status is best effort
+                    qs = {}
+                pend = (qs.get("pending_work_units") or 0) + (qs.get("in_progress_work_units") or 0)
+                result = (
+                    "Memory consolidation was scheduled. It runs in the background after any "
+                    "queued extraction work and usually takes a few minutes; the peer card and "
+                    "summary update when it finishes. Tell the user to run `/memory show` later."
+                )
+                if pend:
+                    result += f" There are currently {pend} background work units ahead of it."
             elif name == "remember":
                 if not arg:
                     result = "Usage: `/memory remember <fact>`. No fact was given; nothing stored."
