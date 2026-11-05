@@ -60,6 +60,23 @@ class Filter:
         inject_peer_card: bool = Field(default=True, description="Include the peer card.")
         inject_representation: bool = Field(default=True, description="Include the representation.")
         context_max_chars: int = Field(default=3000, description="Max chars of injected memory.")
+        curate_context: bool = Field(
+            default=True,
+            description="Distil Honcho observations into durable, query-relevant facts before injecting.",
+        )
+        context_max_tokens: int = Field(
+            default=400, description="Token budget (approx) for curated observations."
+        )
+        observation_max_age_days: int = Field(
+            default=30, description="Non-durable unrelated observations older than this are dropped."
+        )
+        always_include_durable: int = Field(
+            default=3, description="Max durable-but-unrelated facts included regardless of the query."
+        )
+        dedupe_owui_memories: bool = Field(
+            default=True,
+            description="Skip Honcho facts already stored in Open WebUI's built-in memory.",
+        )
         search_top_k: int = Field(default=10, description="Candidates shown for /memory forget.")
         max_conclusions: int = Field(default=25, description="Max conclusions fetched per turn.")
         save_assistant_messages: bool = Field(
@@ -201,6 +218,17 @@ class Filter:
         return -1
 
     # ------------------------------------------------------------------ inlet
+    @staticmethod
+    async def _owui_memory_texts(user_id: str) -> list[str]:
+        """Open WebUI built-in memory contents for dedupe; [] when unavailable."""
+        try:
+            from open_webui.models.memories import Memories  # type: ignore
+
+            mems = await asyncio.to_thread(Memories.get_memories_by_user_id, user_id)
+            return [m.content for m in (mems or []) if getattr(m, "content", None)]
+        except Exception:  # noqa: BLE001 - optional integration
+            return []
+
     async def inlet(
         self,
         body: dict,
@@ -245,6 +273,19 @@ class Filter:
                 label = self.valves.user_label.replace("{name}", str(user.get("name") or "the user"))
                 rep = mask_peer_ids(rep, [user_pid], label) if rep else rep
                 card = [mask_peer_ids(c, [user_pid], label) for c in card] if card else card
+            if self.valves.curate_context and rep:
+                known = list(card or [])
+                if self.valves.dedupe_owui_memories:
+                    known += await self._owui_memory_texts(uid)
+                kept = curate_observations(
+                    rep,
+                    text,
+                    known_texts=known,
+                    max_tokens=self.valves.context_max_tokens,
+                    max_age_days=self.valves.observation_max_age_days,
+                    always_keep=self.valves.always_include_durable,
+                )
+                rep = "\n".join(f"- {k}" for k in kept)
             header = "Memory about this user"
             if uv.extra_instructions.strip():
                 header += ". " + uv.extra_instructions.strip()
