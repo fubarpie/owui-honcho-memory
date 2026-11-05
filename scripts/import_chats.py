@@ -23,7 +23,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -54,7 +54,7 @@ def iso(ts) -> str | None:
         ts = float(ts)
         if ts > 1e12:  # milliseconds
             ts /= 1000
-        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(ts, tz=UTC).isoformat()
     except (TypeError, ValueError, OSError):
         return None
 
