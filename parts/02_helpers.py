@@ -1,6 +1,7 @@
 """Pure helper functions (no I/O, no network) for the Honcho memory filter."""
 
 import copy
+import json
 import re
 from typing import Any
 
@@ -333,6 +334,57 @@ def _compact(text: str) -> str:
     return (t[:1].upper() + t[1:]) if t else text
 
 
+_JSON_VALUE_RE = re.compile(r'"content"\s*,\s*\{.*?"value"\s*:\s*"((?:[^"\\]|\\.)*)"', re.DOTALL)
+
+
+def unwrap_observation(text: str) -> str:
+    """Recover plain text from an observation the server stored as a structured-output blob.
+
+    Some extraction models leak their wrapper, e.g.
+    ``{"completionState":"complete","entries":[["content",{"type":"String","value":"..."}]]}``.
+    Returns the inner ``content`` string; ``""`` when a JSON-looking blob has no recoverable
+    content (so the caller drops it); plain text is returned unchanged.
+    """
+    t = (text or "").strip()
+    if not t.startswith(("{", "[")):
+        return t
+    try:
+        obj: Any = json.loads(t)
+    except ValueError:
+        obj = None
+
+    def walk(o: Any) -> str:
+        if isinstance(o, dict):
+            if isinstance(o.get("content"), str):
+                return o["content"]
+            for v in o.values():
+                r = walk(v)
+                if r:
+                    return r
+        elif isinstance(o, list):
+            if len(o) == 2 and o[0] == "content":
+                v = o[1]
+                if isinstance(v, dict) and isinstance(v.get("value"), str):
+                    return v["value"]
+                if isinstance(v, str):
+                    return v
+            for v in o:
+                r = walk(v)
+                if r:
+                    return r
+        return ""
+
+    found = walk(obj) if obj is not None else ""
+    if not found:
+        m = _JSON_VALUE_RE.search(t)
+        if m:
+            try:
+                found = json.loads('"' + m.group(1) + '"')
+            except ValueError:
+                found = m.group(1)
+    return found.strip()
+
+
 def parse_observations(representation: str | None) -> list[tuple[str, str | None]]:
     """Split a Honcho representation into ``(text, iso_date|None)`` observations.
 
@@ -359,7 +411,7 @@ def parse_observations(representation: str | None) -> list[tuple[str, str | None
         if m:
             date = m.group(1)
             text = text[m.end():]
-        text = text.strip()
+        text = unwrap_observation(text.strip())
         if text:
             out.append((text, date))
     return out

@@ -67,3 +67,19 @@ def test_token_budget_and_always_keep():
 def test_empty_inputs():
     assert h.curate_observations(None, "q") == []
     assert h.curate_observations("", None) == []
+
+
+def test_json_wrapped_observation_is_unwrapped_and_deduped():
+    blob = ('{"completionState":"complete","entries":[["source_indices",{"completionState":"complete",'
+            '"items":[{"type":"Number","value":1}],"type":"Array"}],["content",{"completionState":"complete",'
+            '"type":"String","value":"the user maintains and patches the Git Repo Manager tool."}]],"type":"Object"}')
+    obs = h.parse_observations("- " + blob)
+    assert obs == [("the user maintains and patches the Git Repo Manager tool.", None)]
+    assert h.curate_observations("- " + blob, "git repo manager",
+                               known_texts=["Git Repo Manager tool the user maintains and patches"]) == []
+    kept = h.curate_observations("- " + blob, "git repo manager")
+    assert kept and "{" not in kept[0]
+
+
+def test_unrecoverable_json_blob_is_dropped():
+    assert h.parse_observations('- {"foo": [1,2,3]}') == []
