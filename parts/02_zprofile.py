@@ -7,12 +7,10 @@ is_transient, _compact, truncate_to_tokens) — parts share one namespace after 
 
 
 import datetime as _dt
-import json
 import re
 from collections import OrderedDict
+from collections.abc import Sequence
 from typing import Any, NamedTuple
-
-from typing import Callable, Iterable, Sequence
 
 
 class Obs(NamedTuple):
@@ -25,9 +23,9 @@ class Obs(NamedTuple):
 
 
 _SECTION_KIND_RE: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"explicit", re.I), "explicit"),
-    (re.compile(r"deduct", re.I), "deductive"),
-    (re.compile(r"induct|pattern|tendenc", re.I), "inductive"),
+    (re.compile(r"explicit", re.IGNORECASE), "explicit"),
+    (re.compile(r"deduct", re.IGNORECASE), "deductive"),
+    (re.compile(r"induct|pattern|tendenc", re.IGNORECASE), "inductive"),
 ]
 
 
@@ -225,7 +223,7 @@ class ProfileCache:
 
     def __init__(self, capacity: int = 512) -> None:
         self._capacity = max(1, int(capacity))
-        self._data: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._data: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     def get(self, uid: str) -> str:
         """Return cached profile text ('' if none); refreshes LRU position."""

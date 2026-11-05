@@ -15,8 +15,8 @@ def _load_module():
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     ns = {}
-    exec((ROOT / "parts" / "02_helpers.py").read_text(), ns)
-    exec((ROOT / "parts" / "02_zprofile.py").read_text(), ns)
+    exec((ROOT / "parts" / "02_helpers.py").read_text(), ns)  # noqa: S102 - parts share one namespace after build
+    exec((ROOT / "parts" / "02_zprofile.py").read_text(), ns)  # noqa: S102 - parts share one namespace after build
     return type("M", (), ns)
 
 
@@ -56,7 +56,6 @@ JSON_BLOB = json.dumps(
 
 def test_parse_typed_kinds_and_premise_counts():
     obs = m.parse_typed_observations(REP)
-    kinds = [(o.text[:30], o.kind, o.premise_count) for o in obs]
     assert len(obs) == 9
     by_txt = {o.text: o for o in obs}
     assert by_txt["the user promised to send the API key by Friday."].kind == "explicit"

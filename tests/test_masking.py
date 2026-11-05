@@ -80,8 +80,8 @@ class MaskingClient:
         self.added = []
         self.peer_id = "user-01234567-89ab-cdef-0123-456789abcdef"
         self.ctx = {
-            "representation": f"user-01234567-89ab-cdef-0123-456789abcdef likes tea.",
-            "peer_card": [f"Name on card: user-01234567"],
+            "representation": "user-01234567-89ab-cdef-0123-456789abcdef likes tea.",
+            "peer_card": ["Name on card: user-01234567"],
         }
 
     async def ensure_workspace(self):
