@@ -673,6 +673,165 @@ def should_skip(body: dict | None, user: dict | None, valves: Any = None) -> str
     return None
 
 
+# --------------------------------------------------------------------------- curation
+# Honcho's "representation" is a dated stream of observations. These helpers distil it
+# into a short list of durable, query-relevant facts so we stop re-injecting noise.
+_OBS_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}(?::\d{2})?)?\]\s*")
+_BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+_WORD_RE = re.compile(r"[a-z0-9][a-z0-9_.+#-]*")
+_STOPWORDS = frozenset(
+    ["a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for", "with", "from", "by", "as", "is", "are", "was", "were", "be", "been", "being", "it", "its", "this", "that", "these", "those", "user", "users", "their", "his", "her", "they", "them", "he", "she", "we", "you", "i", "me", "my", "our", "your", "do", "does", "did", "has", "have", "had", "will", "would", "can", "could", "should", "may", "might", "about", "into", "over", "also", "not", "no", "yes", "so", "if", "then", "than", "there", "here", "what", "which", "who", "whom", "how", "when", "where", "why", "all", "any", "some", "more", "most", "other", "such", "only", "own", "same", "too", "very", "just"]
+)
+# One-off session activity: useful for a moment, worthless a week later.
+_TRANSIENT_RE = re.compile(
+    r"\b(ctrl\s*\+?\s*c|interrupted|traceback|eoferror|stack\s*trace|error message|pasted|"
+    r"ran (?:a |the |an )?(?:\w+ )?(?:script|command)|running (?:a |the )?(?:\w+ )?(?:script|command)|"
+    r"polling|pending|remaining|stuck at|queue|\d+\s*(?:/|of)\s*\d+|completed \d+|"
+    r"(?:asked|wants?) (?:to|for) (?:the )?(?:merge|merged|merging)\b|asked for pr|"
+    r"reported (?:on )?\d{4}-\d{2}-\d{2}|at \d{1,2}:\d{2}(?::\d{2})?)\b",
+    re.IGNORECASE,
+)
+_DURABLE_RE = re.compile(
+    r"\b(wants?|would like|prefers?|likes?|dislikes?|always|never|uses?|has an?|lives?|works?|"
+    r"owns?|maintains?|building|goal|plans?|architecture|decid\w+|roadmap|one \w+ per|self-hosted)\b",
+    re.IGNORECASE,
+)
+
+
+def _tokens(text: str) -> set[str]:
+    words = (w.rstrip(".+-_") for w in _WORD_RE.findall((text or "").lower()))
+    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
+
+
+def _similar(a: set[str], b: set[str], threshold: float) -> bool:
+    """Jaccard or containment similarity of two token sets."""
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    return inter / len(a | b) >= threshold or inter / min(len(a), len(b)) >= 0.8
+
+
+def _compact(text: str) -> str:
+    """Drop the redundant leading 'the user ' and capitalise (saves tokens)."""
+    t = re.sub(r"^the user\s+", "", text.strip(), flags=re.IGNORECASE)
+    return (t[:1].upper() + t[1:]) if t else text
+
+
+def parse_observations(representation: str | None) -> list[tuple[str, str | None]]:
+    """Split a Honcho representation into ``(text, iso_date|None)`` observations.
+
+    Drops section headers ("## Explicit Observations"), "Premises:" sub-lists and blanks.
+    """
+    out: list[tuple[str, str | None]] = []
+    in_premises = False
+    for raw in (representation or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or (line.endswith(":") and len(line) < 40 and "[" not in line):
+            in_premises = in_premises and line.lower() != "" and not line.startswith("#")
+            if line.lower().rstrip(":") == "premises":
+                in_premises = True
+            continue
+        if line.lower().startswith("premises"):
+            in_premises = True
+            continue
+        m = _OBS_TS_RE.match(_BULLET_RE.sub("", line))
+        if in_premises and not m:
+            continue  # premise detail line
+        in_premises = False
+        text = _BULLET_RE.sub("", line)
+        date = None
+        if m:
+            date = m.group(1)
+            text = text[m.end():]
+        text = text.strip()
+        if text:
+            out.append((text, date))
+    return out
+
+
+def is_transient(text: str) -> bool:
+    """True for one-off event noise (script runs, interrupts, queue counts...)."""
+    return bool(_TRANSIENT_RE.search(text or ""))
+
+
+def curate_observations(
+    representation: str | None,
+    query: str | None,
+    *,
+    known_texts: list[str] | None = None,
+    max_tokens: int = 400,
+    max_age_days: int = 30,
+    always_keep: int = 3,
+    today: str | None = None,
+) -> list[str]:
+    """Distil a representation into durable, relevant, de-duplicated fact lines.
+
+    * transient event noise is dropped;
+    * facts already present in ``known_texts`` (peer card, OWUI memories) are dropped;
+    * near-duplicates are merged (newest kept);
+    * lines overlapping the ``query`` rank first; unrelated lines survive only if durable-looking
+      (top ``always_keep``) and, when not durable, only if newer than ``max_age_days``;
+    * output fits ``max_tokens`` (approx_tokens) and carries no timestamps.
+    """
+    import datetime as _dt
+
+    try:
+        now = _dt.date.fromisoformat(today) if today else _dt.date.today()
+    except ValueError:
+        now = _dt.date.today()
+    qtok = _tokens(query or "")
+    known = [_tokens(k) for k in (known_texts or []) if k]
+
+    cands: list[dict] = []
+    for text, date in parse_observations(representation):
+        if is_transient(text):
+            continue
+        tok = _tokens(text)
+        if not tok or any(_similar(tok, k, 0.6) for k in known):
+            continue
+        try:
+            age = (now - _dt.date.fromisoformat(date)).days if date else 0
+        except ValueError:
+            age = 0
+        cands.append({"text": text, "tok": tok, "age": max(age, 0), "date": date or ""})
+
+    # Merge near-duplicates, preferring the newest (then longest) phrasing.
+    cands.sort(key=lambda c: (c["age"], -len(c["text"])))
+    uniq: list[dict] = []
+    for c in cands:
+        if not any(_similar(c["tok"], u["tok"], 0.7) for u in uniq):
+            uniq.append(c)
+
+    scored: list[tuple[float, dict, bool, bool]] = []
+    for c in uniq:
+        overlap = len(qtok & c["tok"]) / len(qtok) if qtok else 0.0
+        relevant = overlap > 0
+        durable = bool(_DURABLE_RE.search(c["text"]))
+        recency = 0.5 / (1 + c["age"] / 30)
+        score = 2.0 * overlap + (0.5 if durable else 0.0) + recency
+        scored.append((score, c, relevant, durable))
+    scored.sort(key=lambda t: -t[0])
+
+    kept: list[str] = []
+    used = 0
+    unrelated = 0
+    for score, c, relevant, durable in scored:
+        if not relevant:
+            if not durable and max_age_days and c["age"] > max_age_days:
+                continue
+            if not durable:
+                continue  # unrelated + not clearly durable: skip entirely
+            if unrelated >= always_keep:
+                continue
+            unrelated += 1
+        cost = approx_tokens(c["text"]) + 1
+        if used + cost > max_tokens:
+            continue
+        kept.append(_compact(c["text"]))
+        used += cost
+    return kept
+
+
 # ---- 03_filter.py ----
 _log = logging.getLogger("honcho_memory")
 
@@ -727,6 +886,23 @@ class Filter:
         inject_peer_card: bool = Field(default=True, description="Include the peer card.")
         inject_representation: bool = Field(default=True, description="Include the representation.")
         context_max_chars: int = Field(default=3000, description="Max chars of injected memory.")
+        curate_context: bool = Field(
+            default=True,
+            description="Distil Honcho observations into durable, query-relevant facts before injecting.",
+        )
+        context_max_tokens: int = Field(
+            default=400, description="Token budget (approx) for curated observations."
+        )
+        observation_max_age_days: int = Field(
+            default=30, description="Non-durable unrelated observations older than this are dropped."
+        )
+        always_include_durable: int = Field(
+            default=3, description="Max durable-but-unrelated facts included regardless of the query."
+        )
+        dedupe_owui_memories: bool = Field(
+            default=True,
+            description="Skip Honcho facts already stored in Open WebUI's built-in memory.",
+        )
         search_top_k: int = Field(default=10, description="Candidates shown for /memory forget.")
         max_conclusions: int = Field(default=25, description="Max conclusions fetched per turn.")
         save_assistant_messages: bool = Field(
@@ -868,6 +1044,17 @@ class Filter:
         return -1
 
     # ------------------------------------------------------------------ inlet
+    @staticmethod
+    async def _owui_memory_texts(user_id: str) -> list[str]:
+        """Open WebUI built-in memory contents for dedupe; [] when unavailable."""
+        try:
+            from open_webui.models.memories import Memories  # type: ignore
+
+            mems = await asyncio.to_thread(Memories.get_memories_by_user_id, user_id)
+            return [m.content for m in (mems or []) if getattr(m, "content", None)]
+        except Exception:  # noqa: BLE001 - optional integration
+            return []
+
     async def inlet(
         self,
         body: dict,
@@ -912,6 +1099,19 @@ class Filter:
                 label = self.valves.user_label.replace("{name}", str(user.get("name") or "the user"))
                 rep = mask_peer_ids(rep, [user_pid], label) if rep else rep
                 card = [mask_peer_ids(c, [user_pid], label) for c in card] if card else card
+            if self.valves.curate_context and rep:
+                known = list(card or [])
+                if self.valves.dedupe_owui_memories:
+                    known += await self._owui_memory_texts(uid)
+                kept = curate_observations(
+                    rep,
+                    text,
+                    known_texts=known,
+                    max_tokens=self.valves.context_max_tokens,
+                    max_age_days=self.valves.observation_max_age_days,
+                    always_keep=self.valves.always_include_durable,
+                )
+                rep = "\n".join(f"- {k}" for k in kept)
             header = "Memory about this user"
             if uv.extra_instructions.strip():
                 header += ". " + uv.extra_instructions.strip()
