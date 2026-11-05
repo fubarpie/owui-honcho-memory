@@ -111,6 +111,7 @@ rewrites the message rather than bypassing the model):
 | `/memory` or `/memory show` | Ask the model to display what it remembers about you. |
 | `/memory remember <fact>` | Save a fact now (as a message Honcho will reason into a conclusion). |
 | `/memory forget` | Ask the model/Honcho to surface memories for removal. |
+| `/memory dream` | Trigger memory consolidation now (builds the peer card; runs in the background). |
 | `/memory off` / `/memory on` | Toggle your memory (UserValves) — off stops fetch & save. |
 | `/memory ask <question>` | Dialectic query: Honcho reasons *about you* to answer. |
 | `/memory help` | Command help. |
